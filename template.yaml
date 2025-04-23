@@ -1,0 +1,232 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for get-smile stack with S3 bucket, SQS queue, Lambda function, and ElastiCache Valkey'
+
+Resources:
+  GetSmileVinylBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: get-smile-vinyl
+
+  PurchaseSmileVinylQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: purchase-smile-vinyl
+      VisibilityTimeout: 300
+      MessageRetentionPeriod: 1209600  # 14 days in seconds
+
+  # ElastiCache Valkey (Redis) Subnet Group
+  GetSmileVinylSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: Subnet group for get-smile-vinyl ElastiCache
+      SubnetIds:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+
+  # ElastiCache Valkey (Redis) Security Group
+  GetSmileVinylSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for get-smile-vinyl ElastiCache
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          SourceSecurityGroupId: !GetAtt LambdaSecurityGroup.GroupId
+
+  # ElastiCache Valkey (Redis) Cluster
+  GetSmileVinylCache:
+    Type: AWS::ElastiCache::CacheCluster
+    Properties:
+      ClusterName: get-smile-vinyl
+      CacheNodeType: cache.t3.micro
+      Engine: redis
+      EngineVersion: '7.1'
+      NumCacheNodes: 1
+      CacheSubnetGroupName: !Ref GetSmileVinylSubnetGroup
+      VpcSecurityGroupIds:
+        - !GetAtt GetSmileVinylSecurityGroup.GroupId
+      Tags:
+        - Key: Name
+          Value: get-smile-vinyl
+
+  # Security Group for Lambda to access ElastiCache
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Lambda to access ElastiCache
+      VpcId: !Ref VPC
+
+  # VPC for the resources
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: GetSmileVinylVPC
+
+  # Subnets for ElastiCache
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: GetSmileVinylPublicSubnet1
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: GetSmileVinylPublicSubnet2
+
+  # S3 VPC Endpoint
+  S3VPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcId: !Ref VPC
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PublicRouteTable
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action:
+              - 's3:GetObject'
+              - 's3:PutObject'
+              - 's3:ListBucket'
+            Resource:
+              - !Sub 'arn:aws:s3:::${GetSmileVinylBucket}'
+              - !Sub 'arn:aws:s3:::${GetSmileVinylBucket}/*'
+      Tags:
+        - Key: Name
+          Value: GetSmileVinylVPC
+
+  # Route Table for the VPC
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: GetSmileVinylPublicRouteTable
+
+  # Associate Route Table with Subnets
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  GetSmileVinylLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: get-smile-vinyl
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt GetSmileVinylLambdaRole.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !GetAtt LambdaSecurityGroup.GroupId
+        SubnetIds:
+          - !Ref PublicSubnet1
+          - !Ref PublicSubnet2
+      Environment:
+        Variables:
+          REDIS_ENDPOINT: !GetAtt GetSmileVinylCache.RedisEndpoint.Address
+          REDIS_PORT: !GetAtt GetSmileVinylCache.RedisEndpoint.Port
+      Code:
+        ZipFile: |
+          exports.handler = async (event) => {
+            console.log('Received event:', JSON.stringify(event, null, 2));
+            return {
+              statusCode: 200,
+              headers: {
+                'Content-Type': 'application/json'
+              },
+              body: JSON.stringify({ message: 'ok' })
+            };
+          };
+  GetSmileVinylLambdaFunctionURL:
+    Type: AWS::Lambda::Url
+    DependsOn: GetSmileVinylLambdaFunction
+    Properties:
+      AuthType: NONE
+      TargetFunctionArn: !GetAtt GetSmileVinylLambdaFunction.Arn
+
+  GetSmileVinylLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole'
+      Policies:
+        - PolicyName: SQSReceiveMessagePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'sqs:ReceiveMessage'
+                  - 'sqs:DeleteMessage'
+                  - 'sqs:GetQueueAttributes'
+                Resource: !GetAtt PurchaseSmileVinylQueue.Arn
+
+  SQSQueueToLambdaMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 10
+      Enabled: true
+      EventSourceArn: !GetAtt PurchaseSmileVinylQueue.Arn
+      FunctionName: !GetAtt GetSmileVinylLambdaFunction.Arn
+
+Outputs:
+  GetSmileVinylLambdaFunctionURL:
+    Description: URL of the Lambda function
+    Value: !GetAtt GetSmileVinylLambdaFunctionURL.FunctionUrl
+
+  PurchaseSmileVinylQueueURL:
+    Description: URL of the SQS queue
+    Value: !Ref PurchaseSmileVinylQueue
+
+  PurchaseSmileVinylQueueARN:
+    Description: ARN of the SQS queue
+    Value: !GetAtt PurchaseSmileVinylQueue.Arn
+
+  GetSmileVinylCacheEndpoint:
+    Description: Endpoint of the ElastiCache Valkey (Redis) cluster
+    Value: !GetAtt GetSmileVinylCache.RedisEndpoint.Address
+
+  GetSmileVinylCachePort:
+    Description: Port of the ElastiCache Valkey (Redis) cluster
+    Value: !GetAtt GetSmileVinylCache.RedisEndpoint.Port
+
+  S3VPCEndpointId:
+    Description: ID of the S3 VPC Endpoint
+    Value: !Ref S3VPCEndpoint
